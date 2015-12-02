@@ -73,7 +73,7 @@ A simple OpenSSL command to encrypt some data follows this form:
 
 `$ openssl enc <cipher> -e -k <password> <<< "This is a plaintext message."`
 
-For `<cipher>`, you can see a list of supported options by running `$ openssl enc list`. We are using `aes-256-cbc` here (many of the ciphers have a shortcut where running `$ openssl aes-256-cbc` is identical to `$ openssl enc -aes-256-cbc`). `-e` instructs the tool to encrypt the data, and `-k` specifies the password. We can use `-in` and `-out` for input and output files, and `-a` as an optional flag to Base64 encode the output. Let's hold off on Base64 encoding for a second to inspect the output
+For `<cipher>`, you can see a list of supported options by running `$ openssl enc list`. We are using `aes-256-cbc` here (many of the ciphers have a shortcut where running `$ openssl aes-256-cbc` is identical to `$ openssl enc -aes-256-cbc`). `-e` instructs the tool to encrypt the data, and `-k` specifies the password. We can use `-in` and `-out` for input and output files, and `-a` as an optional flag to Base64 encode the output. Let's hold off on Base64 encoding for a second to inspect the output. 
 
 Running the above command gives us some output on the command line. 
 
@@ -93,7 +93,9 @@ I've put the output into a file (`plain.enc`) and then viewed a hex dump of the 
 0000020: ad52 3c47 2da6 6b1e f51e da45 7cf0 67d1  .R<G-.k....E|.g.
 ```
 
-Interesting that the first 8 bytes are readable -- and they say "Salted__". This is the header OpenSSL uses to indicate that the file contains a salt. The next 8 bytes are that salt (`2b87 b62e 9aa4 2596` in hex). We can verify this by using a nifty option `-p` that prints the key, IV, and salt used during encryption (here I specified the same salt using `-S` for consistency, but you can run it without this option to verify that it is random each time). **WARNING** For completeness, I will mention that you can obviously provide a constant salt with `-S` or even omit a salt entirely with `-nosalt` but this is _very bad_ and you should not do it. Omitting a salt greatly reduces the key space the attacker needs to compute and weakens the security of your data. The code at the end of this post does handle unsalted decryption for legacy/backward compatibility, but again, do **not** do this.  
+Interesting that the first 8 bytes are readable -- and they say "Salted__". This is the header OpenSSL uses to indicate that the file contains a salt. The next 8 bytes are that salt (`2b87 b62e 9aa4 2596` in hex). We can verify this by using a nifty option `-p` that prints the key, IV, and salt used during encryption (here I specified the same salt using `-S` for consistency, but you can run it without this option to verify that it is random each time). 
+
+**WARNING** For completeness, I will mention that you can obviously provide a constant salt with `-S` or even omit a salt entirely with `-nosalt` but this is **very bad** and you should not do it. Omitting a salt greatly reduces the key space the attacker needs to compute and weakens the security of your data. The code at the end of this post does handle unsalted decryption for legacy/backward compatibility, but again, do **not** do this.  
 
 ```bash
 0s @ 18:51:15 $ openssl aes-256-cbc -e -k thisIsABadPassword -in plain.txt -out plain2.enc -p -S 2b87b62e9aa42596
@@ -106,7 +108,7 @@ iv =0AE33920D6C1329A4661757D0F411249
 0000020: ad52 3c47 2da6 6b1e f51e da45 7cf0 67d1  .R<G-.k....E|.g.
 ```
 
-So now we have a salt, and we have a key and IV value we can check our code against. This is critical. We already noted above that OpenSSL uses an 8 byte salt, and here we are using 16 bytes, so file this away as a potential sticking point. 
+So now we have a salt, and we have a key and IV value we can check our code against. This is critical. We already noted above that OpenSSL uses an 8 byte salt, and in our code we are using 16 bytes, so file this away as a potential sticking point. 
 
 If you have any experience with crypto, you are noticing that the IV value is not present in the file. This surprised me as well. IV values, similar to salts, are necessary for decryption but not considered sensitive data and are routinely sent alongside the cipher text to allow the recipient to decrypt it. Here I relied on helpful information from really smart cryptographer [Thomas Pornin](http://security.stackexchange.com/a/29139/16485). The IV is dependent on the salt, and thus is generated at the same time the key is derived from the password and salt. Wait, let's go back to our code. We didn't generate any IV...
 
@@ -189,7 +191,7 @@ The `PBEParameterSpec` is passed into the `cipher.init(Cipher.ENCRYPT_MODE, secr
 
 The actual encrypting is fairly straightforward as things like the _substitution-permutation network_, _Rijndael S-boxes_, and the _invertible affine transformation_ are all handled behind the scenes by the cryptographic provider, in our case, BouncyCastle. The code is all [open source](http://www.bouncycastle.org/documentation.html) and the [cipher algorithm](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard#Description_of_the_cipher) is explained on Wikipedia, but the odds of a bug in this robust and globally-used library are miniscule compared to the consuming code, so we will stay in our sandbox. 
 
-The code simply creates a `byte[]` buffer, continues reading from the `InputStream`, runs the buffer through the `cipher`
+The code simply creates a `byte[]` buffer, continues reading from the `InputStream`, runs the buffer through the `cipher`, and writes the enciphered bytes out to the `OutputStream`. 
 
 ### Finish
 
@@ -219,7 +221,7 @@ Hopefully at this point you have a solid understanding of the default NiFi inter
 
 I wrote a [prototype OpenSSL PBE AES-256-CBC encryptor](https://github.com/alopresto/opensslpbeencryptor) using [Groovy](http://www.groovy-lang.org) (it wasn't for direct inclusion in NiFi and I find Groovy to be a more expressive language and easier to test with when I'm writing proofs of concept, but every line here can be converted to pure Java, and usually automatically by the IDE). 
 
-The first challenge when actually writing the code to be compatible with OpenSSL-encrypted data was "How does OpenSSL do KDF so we can get the right key and IV knowing only the password and salt?" Luckily, BouncyCastle once again does most of the work for us. The class `org.bouncycastle.crypto.generators.OpenSSLPBEParametersGenerator.java` does the magic. But we should understand what's happening, and with what we learned above, it's really not hard. 
+The first challenge when actually writing the code to be compatible with OpenSSL-encrypted data was "How does OpenSSL do KDF so we can get the right key and IV knowing only the password and salt?" Luckily, BouncyCastle once again does most of the work for us. The class `org.bouncycastle.crypto.generators.OpenSSLPBEParametersGenerator` does the magic. But we should understand what's happening, and with what we learned above, it's really not hard. 
 
 While OpenSSL's documentation is notoriously sparse, the [`EVP_BytesToKey`](http://www.openssl.org/docs/crypto/EVP_BytesToKey.html) function is used to derive the key and IV from the password and salt. This function simply uses the MD5 hash of the password and salt to generate the key, then takes the MD5 of the key, password, and salt as the IV. From the documentation:
 
@@ -286,11 +288,11 @@ As addressed earlier, using `$ openssl enc` mandates this KDF, and `PBKDF2` woul
 
 ### Authenticated Encryption with Associated Data
 
-All of the discussion here revolved around symmetric encryption using PBE. Symmetric encryption provides _confidentiality_, in that an observer cannot determine the content of the message without the secret key, but does not provide _integrity_. Because of this, and especially with CBC, an attacker can manipulate the cipher text without knowing the content and this can have serious negative effects (known as a [Chosen Ciphertext Attack](https://en.wikipedia.org/wiki/Chosen-ciphertext_attack), this is the foundation for many of the previous attacks against SSL/TLS such as Lucky Thirteen or Bleichenbacher). 
+All of the discussion here revolved around symmetric encryption using PBE. Symmetric encryption provides _confidentiality_, in that an observer cannot determine the content of the message without the secret key, but does not provide _integrity_. Because of this, and especially with CBC, an attacker can manipulate the cipher text without knowing the content and this can have serious negative effects (known as a [Chosen Ciphertext Attack](https://en.wikipedia.org/wiki/Chosen-ciphertext_attack), this is the foundation for many of the previous attacks against SSL/TLS such as Lucky Thirteen or Bleichenbacher). The attacker can also intercept and manipulate the cipher text with some knowledge of the contents (perhaps gathered through cribbing) and corrupt the data without knowledge of the key. **Add notes on cribbing?**
 
-To provide message integrity with symmetric encryption, a Message Authentication Code (MAC) is needed. Similar to a checksum, this "authentication tag" is calculated over the cipher text using an algorithm known to both parties and (usually) some secret value. [Hash-based MACs (HMAC)](https://en.wikipedia.org/wiki/Hash-based_message_authentication_code) are a common tool for this, but come with their own caveats. 
+To provide message integrity with symmetric encryption, a Message Authentication Code (MAC) is needed. Similar to a checksum, this "authentication tag" is calculated over the cipher text using an algorithm known to both parties and (usually) some secret value. [Hash-based MACs (HMAC)](https://en.wikipedia.org/wiki/Hash-based_message_authentication_code) are a common tool for this, but come with their own caveats:  
 
-1. The key used for the HMAC calculation must be unrelated to the encryption key.
+1. The key used for the HMAC calculation must be unrelated to the encryption key. This means two keys must be exchanged between the parties. 
 1. The HMAC must be calculated over the cipher text, not plaintext.
 1. The HMAC verification step must come before decryption.
 1. The verification step must not introduce a timing attack vulnerability (Java is [especially prone to this](http://codahale.com/a-lesson-in-timing-attacks/) as String equality comparison short circuits on inequality by design and even `MessageDigest.isEquals()` was susceptible to this until Java SE 6 Update 17)
