@@ -73,7 +73,7 @@ A simple OpenSSL command to encrypt some data follows this form:
 
 `$ openssl enc <cipher> -e -k <password> <<< "This is a plaintext message."`
 
-For `<cipher>`, you can see a list of supported options by running `$ openssl enc list`. We are using `aes-256-cbc` here. `-e` instructs the tool to encrypt the data, and `-k` specifies the password. We can use `-in` and `-out` for input and output files, and `-a` as an optional flag to Base64 encode the output. Let's hold off on Base64 encoding for a second to inspect the output
+For `<cipher>`, you can see a list of supported options by running `$ openssl enc list`. We are using `aes-256-cbc` here (many of the ciphers have a shortcut where running `$ openssl aes-256-cbc` is identical to `$ openssl enc -aes-256-cbc`). `-e` instructs the tool to encrypt the data, and `-k` specifies the password. We can use `-in` and `-out` for input and output files, and `-a` as an optional flag to Base64 encode the output. Let's hold off on Base64 encoding for a second to inspect the output
 
 Running the above command gives us some output on the command line. 
 
