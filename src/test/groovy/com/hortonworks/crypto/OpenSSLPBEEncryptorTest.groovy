@@ -3,11 +3,17 @@ package com.hortonworks.crypto
 import org.apache.commons.codec.CharEncoding
 import org.apache.commons.codec.binary.Hex
 import org.apache.log4j.Logger
+import org.bouncycastle.crypto.generators.OpenSSLPBEParametersGenerator
 import org.bouncycastle.crypto.params.KeyParameter
 import org.bouncycastle.crypto.params.ParametersWithIV
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
+
+import javax.crypto.Cipher
+import javax.crypto.SecretKey
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * Created by alopresto on 11/25/15.
@@ -630,5 +636,118 @@ public class OpenSSLPBEEncryptorTest {
         // Assert
         assert Arrays.equals(keyBytes, Hex.decodeHex(EXPECTED_KEY_HEX.toCharArray()))
         assert Arrays.equals(ivBytes, Hex.decodeHex(EXPECTED_IV_HEX.toCharArray()))
+    }
+
+
+    @Test
+    public void testShouldDeriveKeyUsingJCEAPI() throws Exception {
+        // Arrange
+        logger.info("Using password: ${PASSWORD}")
+
+        Hex asciiDecoder = new Hex(CharEncoding.US_ASCII)
+        Hex defaultDecoder = new Hex()
+
+        final String EXPECTED_SALT_HEX = "4D41C78350EE0CE8"
+
+        // It does not matter what hex decoder encoding we use to translate the hex salt to bytes
+        byte[] asciiDecodedBytes = asciiDecoder.decode(EXPECTED_SALT_HEX) as byte[]
+        logger.info("  ASCII decoded salt: ${fb(asciiDecodedBytes)}")
+
+        def defaultDecodedBytes = defaultDecoder.decode(EXPECTED_SALT_HEX) as byte[]
+        logger.info("Default decoded salt: ${fb(defaultDecodedBytes)}")
+
+        assert Arrays.equals(asciiDecodedBytes, defaultDecodedBytes)
+
+        final String RAW_SALT_ASCII = h2a(EXPECTED_SALT_HEX)
+        logger.info("Using salt: ${s(EXPECTED_SALT_HEX.toLowerCase())} | ${RAW_SALT_ASCII}")
+        logger.info("Salt bytes: ${h2b(EXPECTED_SALT_HEX)}")
+        logger.info("Salt ASCII: ${fb(RAW_SALT_ASCII.getBytes("US-ASCII"))}")
+
+        final String EXPECTED_KEY_HEX = "9C876867E3E914DE8E6249D1C5B4EC21DBCEB8A3F1A09579C8C5AE08B73DCB2E"
+        logger.info("Expected key: ${EXPECTED_KEY_HEX.toLowerCase()}")
+        final String EXPECTED_IV_HEX = "C3A9B16EA80F76CEDA1DB445A62F1BC2"
+        logger.info("Expected IV: ${EXPECTED_IV_HEX.toLowerCase()}")
+
+        // Derive the key and IV from BouncyCastle
+        ParametersWithIV cp = OpenSSLPBEEncryptor.deriveKeyFromPassword(PASSWORD, EXPECTED_SALT_HEX) as ParametersWithIV
+
+        byte[] keyBytes = (cp.parameters as KeyParameter).key
+        logger.info("Derived key: ${Hex.encodeHexString(keyBytes)} | ${encoder.encodeToString(keyBytes)}")
+
+        byte[] ivBytes = cp.IV
+        logger.info("Derived IV: ${Hex.encodeHexString(ivBytes)} | ${encoder.encodeToString(ivBytes)}")
+
+        // Act
+
+        // Derive the key and IV as NiFi will
+        Cipher cipher = Cipher.getInstance("PBEWITHMD5AND256BITAES-CBC-OPENSSL")
+
+        byte[] salt = Hex.decodeHex(EXPECTED_SALT_HEX.toCharArray())
+        OpenSSLPBEParametersGenerator gen = new OpenSSLPBEParametersGenerator();
+        gen.init(PASSWORD.getBytes("UTF-8"), salt);
+        int keyLengthBits = 256 //getKeyLengthInBitsFromAlgorithm(cipher.getAlgorithm());
+        int ivLengthBits = cipher.getBlockSize() * 8;
+        ParametersWithIV parametersWithIV = ((ParametersWithIV) gen.generateDerivedParameters(keyLengthBits, ivLengthBits));
+
+        logger.info("NiFi derived key: ${Hex.encodeHexString(parametersWithIV.parameters.key)}")
+        logger.info("NiFi derived IV: ${Hex.encodeHexString(parametersWithIV.IV)}")
+
+        final byte[] keyBytesFromParameters = ((KeyParameter) parametersWithIV.getParameters()).getKey();
+        SecretKey key = new SecretKeySpec(keyBytesFromParameters, "AES");
+
+        // Assert
+        assert Arrays.equals(keyBytes, Hex.decodeHex(EXPECTED_KEY_HEX.toCharArray()))
+        assert Arrays.equals(ivBytes, Hex.decodeHex(EXPECTED_IV_HEX.toCharArray()))
+
+        assert Arrays.equals(key.getEncoded(), Hex.decodeHex(EXPECTED_KEY_HEX.toCharArray()))
+        assert Arrays.equals(parametersWithIV.getIV(), Hex.decodeHex(EXPECTED_IV_HEX.toCharArray()))
+    }
+
+    @Test
+    public void testShouldDecryptUsingJCEAPI() throws Exception {
+        // Arrange
+        File file = new File("src/test/resources/salted_raw.enc")
+        byte[] encryptedBytes = file.bytes
+        logger.info("Read encrypted bytes: ${Hex.encodeHexString(encryptedBytes)}")
+
+        String saltHex = OpenSSLPBEEncryptor.extractHexSaltFromHeader(encryptedBytes)
+        logger.info("Extracted salt hex:   ${saltHex.padLeft(saltHex.length() * 2)}")
+
+        byte[] cipherBytes = OpenSSLPBEEncryptor.extractCipherTextFromBody(encryptedBytes)
+        logger.info("Cipher text:          ${Hex.encodeHexString(cipherBytes).padLeft(encryptedBytes.length * 2)} | ${cipherBytes.length * 2}")
+
+        logger.info("Using password: ${PASSWORD} and salt: ${saltHex}")
+
+        // Set up the cipher as NiFi will
+//        Cipher cipher = Cipher.getInstance("PBEWITHMD5AND256BITAES-CBC-OPENSSL")
+        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS7Padding")
+
+        byte[] salt = Hex.decodeHex(saltHex.toCharArray())
+        OpenSSLPBEParametersGenerator gen = new OpenSSLPBEParametersGenerator();
+        gen.init(PASSWORD.getBytes("UTF-8"), salt);
+        int keyLengthBits = 256 //getKeyLengthInBitsFromAlgorithm(cipher.getAlgorithm());
+        int ivLengthBits = cipher.getBlockSize() * 8;
+        ParametersWithIV parametersWithIV = ((ParametersWithIV) gen.generateDerivedParameters(keyLengthBits, ivLengthBits));
+
+        logger.info("NiFi derived key: ${Hex.encodeHexString(parametersWithIV.parameters.key)}")
+        logger.info("NiFi derived IV: ${Hex.encodeHexString(parametersWithIV.IV)}")
+
+        final byte[] keyBytesFromParameters = ((KeyParameter) parametersWithIV.getParameters()).getKey();
+        SecretKey key = new SecretKeySpec(keyBytesFromParameters, "AES");
+
+        IvParameterSpec ivParameterSpec = new IvParameterSpec(parametersWithIV.IV)
+        logger.info("Created IvParameterSpec: ${Hex.encodeHexString(ivParameterSpec.IV)}")
+
+        // This isn't even using the IVParameterSpec
+        cipher.init(Cipher.DECRYPT_MODE, key, ivParameterSpec)
+        assert cipher.getIV() == ivParameterSpec.IV
+
+        // Act
+        byte[] recoveredBytes = cipher.doFinal(cipherBytes)
+        String recovered = new String(recoveredBytes)
+        logger.info("Recovered: ${recovered} | ${Hex.encodeHexString(recoveredBytes)}")
+
+        // Assert
+        assert plaintext == recovered
     }
 }
