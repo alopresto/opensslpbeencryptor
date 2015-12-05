@@ -1,8 +1,8 @@
-# Decrypting OpenSSL Data in Hortonworks HDF Edge
+# Decrypting OpenSSL Data in Apache NiFi
 
 ## Who Am I?
 
-My name is Andy LoPresto and I am new to the HDF team at Hortonworks. I previously worked in information security (encryption in financial systems & device drivers, PKI, etc.) at Apple and was a security architect at TigerText. 
+My name is Andy LoPresto and I am a software engineer on the HDF team at Hortonworks. I previously worked in information security (encryption in financial systems & device drivers, PKI, etc.) at Apple and was a security architect at TigerText. 
 
 ## The Issue
 
@@ -10,7 +10,7 @@ A question I've been asked many times over my career thus far is, "When should w
 
 Using encryption in high-level languages is usually straightforward in theory at this point, thanks to many helpful libraries such as [BouncyCastle](http://bouncycastle.org/), but can be more difficult in practice. Implementation details matter. Unless you have a Ph.D. in cryptography or discrete mathematics and an extensive background in software engineering (in which case you're not likely to be reading this blog), you should be relying on well-accepted standards and robust best practices, not implementing your own "custom" encryption algorithms. 
 
-Recently we received a customer query on how to use the Encryption Processors to decrypt data. This should be straightforward, and the fact that it wasn't got me involved. 
+Recently we received a customer query on how to use the Encryption Processors to decrypt data in [Apache NiFi](https://nifi.apache.org). This should be straightforward, and the fact that it wasn't got me involved. 
 
 If you're familiar with encryption concepts, you can [skip ahead](#putting-it-in-nifi) to the solution. For everyone else, I'm going to provide a more in-depth explanation to hopefully make this more accessbile. 
 
