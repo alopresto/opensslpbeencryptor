@@ -6,9 +6,7 @@ import org.apache.log4j.Logger
 import org.bouncycastle.crypto.generators.OpenSSLPBEParametersGenerator
 import org.bouncycastle.crypto.params.KeyParameter
 import org.bouncycastle.crypto.params.ParametersWithIV
-import org.junit.After
-import org.junit.Before
-import org.junit.Test
+import org.junit.*
 
 import javax.crypto.Cipher
 import javax.crypto.SecretKey
@@ -17,6 +15,11 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.PBEParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import java.lang.reflect.Field
+import java.security.InvalidKeyException
+import java.security.MessageDigest
+
+import static groovy.test.GroovyAssert.shouldFail
 
 /**
  * Created by alopresto on 11/25/15.
@@ -103,6 +106,10 @@ public class OpenSSLPBEEncryptorTest {
      */
     static String s(final String input, int size = 2, int padding = 4) {
         input.toList().collate(size).collect { it.join().padLeft(padding, " ") }.join(" ")
+    }
+
+    static boolean isUnlimitedStrengthCrypto() {
+        Cipher.getMaxAllowedKeyLength("AES") > 128
     }
 
     @Test
@@ -709,6 +716,8 @@ public class OpenSSLPBEEncryptorTest {
     @Test
     public void testShouldDecryptUsingJCEAPI() throws Exception {
         // Arrange
+        Assume.assumeTrue("This test should only run when unlimited (256 bit) encryption is available", isUnlimitedStrengthCrypto())
+
         File file = new File("src/test/resources/salted_raw.enc")
         byte[] encryptedBytes = file.bytes
         logger.info("Read encrypted bytes: ${Hex.encodeHexString(encryptedBytes)}")
@@ -788,24 +797,6 @@ public class OpenSSLPBEEncryptorTest {
 
         Cipher cipher = Cipher.getInstance(algorithm, "BC");
         cipher.init(Cipher.DECRYPT_MODE, keyFact.generateSecret(pbeSpec), defParams);
-
-//        OpenSSLPBEParametersGenerator gen = new OpenSSLPBEParametersGenerator();
-//        gen.init(PASSWORD.getBytes("UTF-8"), salt);
-//        int keyLengthBits = 256 //getKeyLengthInBitsFromAlgorithm(cipher.getAlgorithm());
-//        int ivLengthBits = cipher.getBlockSize() * 8;
-//        ParametersWithIV parametersWithIV = ((ParametersWithIV) gen.generateDerivedParameters(keyLengthBits, ivLengthBits));
-//
-//        logger.info("NiFi derived key: ${Hex.encodeHexString(parametersWithIV.parameters.key)}")
-//        logger.info("NiFi derived IV: ${Hex.encodeHexString(parametersWithIV.IV)}")
-
-//        final byte[] keyBytesFromParameters = ((KeyParameter) parametersWithIV.getParameters()).getKey();
-//        SecretKey key = new SecretKeySpec(keyBytesFromParameters, "AES");
-//
-//        IvParameterSpec ivParameterSpec = new IvParameterSpec(parametersWithIV.IV)
-//        logger.info("Created IvParameterSpec: ${Hex.encodeHexString(ivParameterSpec.IV)}")
-
-        // This isn't even using the IVParameterSpec
-//        cipher.init(Cipher.DECRYPT_MODE, key, ivParameterSpec)
         assert cipher.getIV() == EXPECTED_IV_BYTES
 
         // Act
@@ -815,5 +806,170 @@ public class OpenSSLPBEEncryptorTest {
 
         // Assert
         assert plaintext == recovered
+    }
+
+    @Test
+    public void testShouldEncryptAndDecryptWith128BitKey() throws Exception {
+        // Arrange
+        MessageDigest sha1 = MessageDigest.getInstance("SHA1")
+        String key = Hex.encodeHexString(sha1.digest("thisIsABadPassword".getBytes()))[0..<32]
+        String iv = Hex.encodeHexString(sha1.digest("thisIsABadIv".getBytes()))[0..<32]
+
+        logger.info("Key: ${key}")
+        logger.info("IV : ${iv}")
+
+        SecretKey secretKey = new SecretKeySpec(Hex.decodeHex(key.toCharArray()), "AES")
+        IvParameterSpec ivParameterSpec = new IvParameterSpec(Hex.decodeHex(iv.toCharArray()))
+
+        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey, ivParameterSpec)
+
+        String message = "This is a plaintext message."
+
+        byte[] cipherBytes = cipher.doFinal(message.getBytes())
+
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, ivParameterSpec)
+
+        byte[] recoveredBytes = cipher.doFinal(cipherBytes)
+
+        String recovered = new String(recoveredBytes)
+        System.out.println("Recovered message: " + recovered)
+
+        assert recovered == message
+    }
+
+    @Test
+    public void testShouldNotEncryptAndDecryptWith256BitKey() throws Exception {
+        // Arrange
+        Assume.assumeTrue("This test should only run when unlimited (256 bit) encryption is not available", !isUnlimitedStrengthCrypto())
+
+        MessageDigest sha1 = MessageDigest.getInstance("SHA1")
+        String key = Hex.encodeHexString(sha1.digest("thisIsABadPassword".getBytes()))[0..<32] * 2
+        String iv = Hex.encodeHexString(sha1.digest("thisIsABadIv".getBytes()))[0..<32]
+
+        // TODO: Figure out a way to emulate limited strength crypto
+        // Manually set the crypto restrictions on a system that has the USC policies installed
+        if (Cipher.getMaxAllowedKeyLength("AES") > 128) {
+            try {
+                Field field = Class.forName("javax.crypto.JceSecurity").
+                        getDeclaredField("isRestricted");
+                field.setAccessible(true);
+                field.set(null, true);
+
+                field = Class.forName("javax.crypto.CryptoPermission").getDeclaredField("maxKeySize")
+                field.setAccessible(true);
+                field.set(null, 128);
+            } catch (Exception e) {
+                logger.fatal(e);
+                Assert.fail("Could not override JCE cryptography strength policy setting");
+            }
+        }
+
+        logger.info("Key: ${key}")
+        logger.info("IV : ${iv}")
+
+        SecretKey secretKey = new SecretKeySpec(Hex.decodeHex(key.toCharArray()), "AES")
+        IvParameterSpec ivParameterSpec = new IvParameterSpec(Hex.decodeHex(iv.toCharArray()))
+
+        Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+
+        // Act
+        def msg = shouldFail(InvalidKeyException) {
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, ivParameterSpec)
+        }
+
+        // Assert
+        assert msg =~ "Illegal key size"
+    }
+
+    @Test
+    public void testShouldEncryptAndDecryptWithPBEShortPassword() throws Exception {
+        // Arrange
+        final String PASSWORD = "password"
+        String salt = "saltsalt"
+
+        logger.info("Password: ${PASSWORD}")
+        logger.info("Salt    : ${salt}")
+
+        String algorithm;
+        algorithm = "PBEWITHMD5AND256BITAES-CBC-OPENSSL"
+        PBEKeySpec pbeSpec = new PBEKeySpec(PASSWORD.toCharArray());
+        SecretKeyFactory secretKeyFactory = SecretKeyFactory.getInstance(algorithm, "BC");
+        SecretKey secretKey = secretKeyFactory.generateSecret(pbeSpec);
+        PBEParameterSpec saltParams = new PBEParameterSpec(salt.getBytes("US-ASCII"), 0);
+
+        Cipher cipher = Cipher.getInstance(algorithm, "BC");
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey, saltParams);
+
+        String message = "This is a plaintext message."
+
+        byte[] cipherBytes = cipher.doFinal(message.getBytes())
+
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, saltParams)
+
+        byte[] recoveredBytes = cipher.doFinal(cipherBytes)
+
+        String recovered = new String(recoveredBytes)
+        System.out.println("Recovered message: " + recovered)
+
+        assert recovered == message
+    }
+
+    @Test
+    public void testShouldNotEncryptAndDecryptWithPBELongPassword() throws Exception {
+        // Arrange
+        Assume.assumeTrue("This test should only run when unlimited (256 bit) encryption is not available", !isUnlimitedStrengthCrypto())
+
+        final String PASSWORD = "thisIsABadPassword"
+        String salt = "saltsalt"
+
+        logger.info("Password: ${PASSWORD}")
+        logger.info("Salt    : ${salt}")
+
+        String algorithm;
+        algorithm = "PBEWITHMD5AND256BITAES-CBC-OPENSSL"
+        PBEKeySpec pbeSpec = new PBEKeySpec(PASSWORD.toCharArray());
+        SecretKeyFactory secretKeyFactory = SecretKeyFactory.getInstance(algorithm, "BC");
+        SecretKey secretKey = secretKeyFactory.generateSecret(pbeSpec);
+        PBEParameterSpec saltParams = new PBEParameterSpec(salt.getBytes("US-ASCII"), 0);
+
+        Cipher cipher = Cipher.getInstance(algorithm, "BC");
+
+        // Act
+        def msg = shouldFail(InvalidKeyException) {
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, saltParams);
+        }
+
+        // Assert
+        assert msg =~ "Illegal key size"
+    }
+
+    @Test
+    public void testShouldNotEncryptAndDecryptWithPBELongPasswordEvenWith128BitKey() throws Exception {
+        // Arrange
+        Assume.assumeTrue("This test should only run when unlimited (256 bit) encryption is not available", !isUnlimitedStrengthCrypto())
+
+        final String PASSWORD = "thisIsABadPassword"
+        String salt = "saltsalt"
+
+        logger.info("Password: ${PASSWORD}")
+        logger.info("Salt    : ${salt}")
+
+        String algorithm;
+        algorithm = "PBEWITHMD5AND128BITAES-CBC-OPENSSL"
+        PBEKeySpec pbeSpec = new PBEKeySpec(PASSWORD.toCharArray());
+        SecretKeyFactory secretKeyFactory = SecretKeyFactory.getInstance(algorithm, "BC");
+        SecretKey secretKey = secretKeyFactory.generateSecret(pbeSpec);
+        PBEParameterSpec saltParams = new PBEParameterSpec(salt.getBytes("US-ASCII"), 0);
+
+        Cipher cipher = Cipher.getInstance(algorithm, "BC");
+
+        // Act
+        def msg = shouldFail(InvalidKeyException) {
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey, saltParams);
+        }
+
+        // Assert
+        assert msg =~ "Illegal key size"
     }
 }

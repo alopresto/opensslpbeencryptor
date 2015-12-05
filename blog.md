@@ -12,7 +12,7 @@ Using encryption in high-level languages is usually straightforward in theory at
 
 Recently we received a customer query on how to use the Encryption Processors to decrypt data. This should be straightforward, and the fact that it wasn't got me involved. 
 
-If you're familiar with encryption concepts, you can [skip ahead](#openssl-pbe-kdf) to the solution. For everyone else, I'm going to provide a more in-depth explanation to hopefully make this more accessbile. 
+If you're familiar with encryption concepts, you can [skip ahead](#putting-it-in-nifi) to the solution. For everyone else, I'm going to provide a more in-depth explanation to hopefully make this more accessbile. 
 
 ## Symmetric Encryption Overview
 
@@ -37,22 +37,23 @@ One more important fact when dealing with any kind of sensitive data hashing or 
 When I examined the PasswordBasedEncryptor, I could see that it accepted a `password` as a property from the processor and an `algorithm`. The `providerName` is a reference to the JCE provider that is loaded. In NiFi, this value is `BC`, referring to [BouncyCastle](http://www.bouncycastle.org), an excellent open source cryptography library for Java and C#.  
 
 ```java
- public PasswordBasedEncryptor(final String algorithm, final String providerName, final char[] password) {
-        super();
-        try {
-            // initialize cipher
-            this.cipher = Cipher.getInstance(algorithm, providerName);
-            int algorithmBlockSize = cipher.getBlockSize();
-            this.saltSize = (algorithmBlockSize > 0) ? algorithmBlockSize : DEFAULT_SALT_SIZE;
-
-            // initialize SecretKey from password
-            PBEKeySpec pbeKeySpec = new PBEKeySpec(password);
-            SecretKeyFactory factory = SecretKeyFactory.getInstance(algorithm, providerName);
-            this.secretKey = factory.generateSecret(pbeKeySpec);
-        } catch (Exception e) {
-            throw new ProcessException(e);
-        }
-    }
+public PasswordBasedEncryptor(final String algorithm, final String providerName, final char[] password) {
+       super();
+       try {
+           // initialize cipher
+           this.cipher = Cipher.getInstance(algorithm, providerName);
+           int algorithmBlockSize = cipher.getBlockSize();
+           this.saltSize = (algorithmBlockSize > 0) ? algorithmBlockSize : DEFAULT_SALT_SIZE;
+           
+           // initialize SecretKey from password
+           PBEKeySpec pbeKeySpec = new PBEKeySpec(password);
+           SecretKeyFactory factory = SecretKeyFactory.getInstance(algorithm, providerName);
+           this.secretKey = factory.generateSecret(pbeKeySpec);
+       } catch (Exception e) {
+           throw new ProcessException(e);
+       }
+   }
+   ...
 ``` 
 
 Let's step through the code above, line by line. First, we get an instance of the specified cipher from the provider. NiFi's algorithm for PBE is an enum called `EncryptionMethod.MD5_256AES` (it actually supports 20 PBE algorithms by default). This resolves to `"PBEWITHMD5AND256BITAES-CBC-OPENSSL"`. This means "password based encryption using MD5 for key derivation and AES-256-CBC for encryption as OpenSSL does it". 
@@ -121,18 +122,18 @@ NiFi's `EncryptContent` processor first initializes the PasswordBasedEncryptor i
 The `getDecryptionCallback()` method simply returns a new instance of the class with no configuration, so let's start with `getEncryptionCallback()`. 
 
 ```java
-	@Override
-    public StreamCallback getEncryptionCallback() throws ProcessException {
-        try {
-            byte[] salt = new byte[saltSize];
-            SecureRandom secureRandom = SecureRandom.getInstance(SECURE_RANDOM_ALGORITHM);
-            secureRandom.setSeed(System.currentTimeMillis());
-            secureRandom.nextBytes(salt);
-            return new EncryptCallback(salt);
-        } catch (Exception e) {
-            throw new ProcessException(e);
-        }
+@Override
+public StreamCallback getEncryptionCallback() throws ProcessException {
+    try {
+        byte[] salt = new byte[saltSize];
+        SecureRandom secureRandom = SecureRandom.getInstance(SECURE_RANDOM_ALGORITHM);
+        secureRandom.setSeed(System.currentTimeMillis());
+        secureRandom.nextBytes(salt);
+        return new EncryptCallback(salt);
+    } catch (Exception e) {
+        throw new ProcessException(e);
     }
+}
 ```
 
 Here we can see that a new `byte[]` is initialized with the size of the salt determined during the constructor. A new `SecureRandom` instance (using `SHA1PRNG` as the random algorithm) is instantiated, seeded with the current time, and then read into the salt. 
@@ -141,7 +142,9 @@ Here we can see that a new `byte[]` is initialized with the size of the salt det
 
 Using `java.security.SecureRandom` instead of `java.math.Random` is definitely the right choice here, but there are a couple issues with the current code. Both of the issues I point out below I learned about from two posts by Amit Sethi of Cigital. 
 
-First, while it is good that the code explicitly specifies the instance of `SecureRandom` to be `SHA1PRNG` (because a call to `.getInstance()` will return whatever the Java properties specify), to be completely explicit, it should be `.getInstance("SHA1PRNG", "SUN")` because the Java cryptographic service provider (CSP) should be selected. [On most systems this will default to Sun](https://www.cigital.com/blog/proper-use-of-javas-securerandom/), but it can conceivably cause issues if a different CSP is prioritized. 
+~~First, while it is good that the code explicitly specifies the instance of `SecureRandom` to be `SHA1PRNG` (because a call to `.getInstance()` will return whatever the Java properties specify), to be completely explicit, it should be `.getInstance("SHA1PRNG", "SUN")` because the Java cryptographic service provider (CSP) should be selected. [On most systems this will default to Sun](https://www.cigital.com/blog/proper-use-of-javas-securerandom/), but it can conceivably cause issues if a different CSP is prioritized. ~~
+
+After [discussing with Joe Witt, Aldrin Piri, and Adam Taft](https://issues.apache.org/jira/browse/NIFI-1240), I've removed this comment. There are scenarios where the Sun CSP is not available (for example, IBM JRE) and we still need to run. In addition, the algorithm does not need to be specified, as in this use case, the `SecureRandom` is just generating a salt and the salt is provided on the wire. There is no compatibility issue between different providers in this case. 
 
 Second, seeding the `SecureRandom` with the current time is most definitely not random and is predictable. `SecureRandom.nextBytes()` actually [self-seeds if the instance had not previously been seeded](https://www.cigital.com/blog/issues-when-using-java-securerandom/), and this manual seeding is decreasing the entropy used. These two issues will be resolved in an upcoming release, but are not related to the encryption issue we are addressing now. 
 
@@ -154,18 +157,18 @@ The class has a single field (the salt), a constructor, and a method `public voi
 ### Setup
 
 ```java
- @Override
-        public void process(final InputStream in, final OutputStream out) throws IOException {
-            final PBEParameterSpec parameterSpec = new PBEParameterSpec(salt, 1000);
-            try {
-                cipher.init(Cipher.ENCRYPT_MODE, secretKey, parameterSpec);
-            } catch (final Exception e) {
-                throw new ProcessException(e);
-            }
+@Override
+public void process(final InputStream in, final OutputStream out) throws IOException {
+    final PBEParameterSpec parameterSpec = new PBEParameterSpec(salt, 1000);
+    try {
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey, parameterSpec);
+    } catch (final Exception e) {
+        throw new ProcessException(e);
+    }
 
-            out.write(salt);
+    out.write(salt);
 
-            ...
+    ...
 ```
 
 That first line looks pretty interesting now, doesn't it? We see that a PBE parameter spec is being declared with our salt and a number. It's a good guess (and borne out by code inspection) that the second parameter is an iteration count. Remember above when we discussed increasing the cost of the key derivation to mitigate attacks? Variable iteration counts for KDFs allow the system to increase the cost of this operation to keep pace with improving hardware and attack optimizations. There is a world of discussion on the ever-continuing battle of cost on [Security StackExchange](http://security.stackexchange.com/questions/17207/recommended-of-rounds-for-bcrypt), [again](http://security.stackexchange.com/questions/3959/recommended-of-iterations-when-using-pkbdf2-sha256/3993#3993), [Joseph Wynn](http://wildlyinaccurate.com/bcrypt-choosing-a-work-factor/), [Anthony Ferrara](http://blog.ircmaxell.com/2012/12/seven-ways-to-screw-up-bcrypt.html), [ECRYPT II](http://www.ecrypt.eu.org/ecrypt2/), and [hashCat](http://hashcat.net/oclhashcat/). 
@@ -177,16 +180,16 @@ The `PBEParameterSpec` is passed into the `cipher.init(Cipher.ENCRYPT_MODE, secr
 ### Process
 
 ```java
- 			...
- 			final byte[] buffer = new byte[65536];
-            int len;
-            while ((len = in.read(buffer)) > 0) {
-                final byte[] encryptedBytes = cipher.update(buffer, 0, len);
-                if (encryptedBytes != null) {
-                    out.write(encryptedBytes);
-                }
-            }
-        	...
+    ...
+    final byte[] buffer = new byte[65536];
+    int len;
+    while ((len = in.read(buffer)) > 0) {
+        final byte[] encryptedBytes = cipher.update(buffer, 0, len);
+        if (encryptedBytes != null) {
+            out.write(encryptedBytes);
+        }
+    }
+    ...
 ```
 
 The actual encrypting is fairly straightforward as things like the _substitution-permutation network_, _Rijndael S-boxes_, and the _invertible affine transformation_ are all handled behind the scenes by the cryptographic provider, in our case, BouncyCastle. The code is all [open source](http://www.bouncycastle.org/documentation.html) and the [cipher algorithm](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard#Description_of_the_cipher) is explained on Wikipedia, but the odds of a bug in this robust and globally-used library are miniscule compared to the consuming code, so we will stay in our sandbox. 
@@ -196,14 +199,13 @@ The code simply creates a `byte[]` buffer, continues reading from the `InputStre
 ### Finish
 
 ```java
-			...
-       		try {
-       		        out.write(cipher.doFinal());
-       		    } catch (final IllegalBlockSizeException | BadPaddingException e) {
-       		        throw new ProcessException(e);
-       		    }
-       		}
-       	} // End of method
+    ...
+    try {
+        out.write(cipher.doFinal());
+    } catch (final IllegalBlockSizeException | BadPaddingException e) {
+        throw new ProcessException(e);
+    }
+} // End of method
 
 ```
 
@@ -234,22 +236,22 @@ Unhelpfully, while the `PKCS5_PBKDF2_HMAC` function is in the OpenSSL library, i
 The Groovy code below generates a `CipherParameters` (actually a `ParametersWithIV` instance) containing the secret key and IV. 
 
 ```groovy
- 	static CipherParameters deriveKeyFromPassword(final String password, final String salt = "") {
-        OpenSSLPBEParametersGenerator gen = new OpenSSLPBEParametersGenerator();
-        // The salt is not safe to pass around in regular string format, so it is hex encoded
-        byte[] saltBytes = Hex.decodeHex(salt.toCharArray())
-        gen.init(password.bytes, saltBytes);
-        CipherParameters cp = gen.generateDerivedParameters(KEY_LENGTH_BITS, IV_LENGTH_BITS);
-        return cp;
-    }
+static CipherParameters deriveKeyFromPassword(final String password, final String salt = "") {
+    OpenSSLPBEParametersGenerator gen = new OpenSSLPBEParametersGenerator();
+    // The salt is not safe to pass around in regular string format, so it is hex encoded
+    byte[] saltBytes = Hex.decodeHex(salt.toCharArray())
+    gen.init(password.bytes, saltBytes);
+    CipherParameters cp = gen.generateDerivedParameters(KEY_LENGTH_BITS, IV_LENGTH_BITS);
+    return cp;
+}
 ```
 
 To decrypt the data, I used BouncyCastle's `PaddedBufferedBlockCipher` class wrapping an `AESEngine` in a `CBCBlockCipher`. Much like the ever-evolving heirarchy of `Reader` and `Stream` classes in Java, a little knowledge of what's available for plug-and-play makes your job easier. The `cipher.init()` call takes two parameters -- a `boolean` (`true` for encrypt, `false` for decrypt, although I probably could have made constants for self-documenting naming helpfulness) and the `ParametersWithIV` container. I delegate the actual byte processing to a method which simply iterates over the input bytes and feeds them to the cipher because I can reuse it identically for encryption. 
 
 ```groovy
- 	byte[] decrypt(byte[] cipherBytes) {
-        PaddedBufferedBlockCipher bufferedBlockCipher = new PaddedBufferedBlockCipher(
-                new CBCBlockCipher(new AESEngine()))
+byte[] decrypt(byte[] cipherBytes) {
+    PaddedBufferedBlockCipher bufferedBlockCipher = new PaddedBufferedBlockCipher(
+        new CBCBlockCipher(new AESEngine()))
 
         try {
             bufferedBlockCipher.init(false, parametersWithIV)
@@ -264,7 +266,103 @@ To decrypt the data, I used BouncyCastle's `PaddedBufferedBlockCipher` class wra
 
 I added a couple utility methods to read the salt and cipher text from the OpenSSL format in raw and Base64 encodings, and slapped a unit test suite on top. 
 
-## Putting It In NiFI (Aldrin, review this section)
+## Putting It In NiFI
+
+I originally took the code discussed above and put it in a new `OpenSSLPBEEncryptor` in NiFi. After [discussing further with Joe Witt and Aldrin Piri](https://issues.apache.org/jira/browse/NIFI-1242), we agreed that the real issue was that the existing code used a non-standard KDF which was incompatible with OpenSSL. As the cipher algorithms available to users indicated OpenSSL compatibility, rather than provide a new encryptor, we decided to offer a choice of KDFs as a property in the processor. This allows backward compatibility with legacy NiFi KDF (MD5 @ 1000 iterations) and the OpenSSL MD5 PKCS#5 v1.5 KDF. With that choice, the code changes become minimal. 
+
+Rather than using the BouncyCastle implementation, we can simply refactor the existing code to make the iteration count variable based on the KDF property. 
+
+```java
+ public PasswordBasedEncryptor(final String algorithm, final String providerName, final char[] password, KeyDerivationFunction kdf) {
+        super();
+        try {
+            // initialize cipher
+            this.cipher = Cipher.getInstance(algorithm, providerName);
+            this.kdf = kdf;
+
+            if (isOpenSSLKDF()) {
+                this.saltSize = OPENSSL_EVP_SALT_SIZE;
+                this.iterationsCount = OPENSSL_EVP_KDF_ITERATIONS;
+            } else {
+                int algorithmBlockSize = cipher.getBlockSize();
+                this.saltSize = (algorithmBlockSize > 0) ? algorithmBlockSize : DEFAULT_SALT_SIZE;
+            }
+
+            // initialize SecretKey from password
+            PBEKeySpec pbeKeySpec = new PBEKeySpec(password);
+            SecretKeyFactory factory = SecretKeyFactory.getInstance(algorithm, providerName);
+            this.secretKey = factory.generateSecret(pbeKeySpec);
+        } catch (Exception e) {
+            throw new ProcessException(e);
+        }
+    }
+    
+    ...
+    
+    
+    public int getIterationsCount() {
+        return iterationsCount;
+    }
+
+    private boolean isOpenSSLKDF() {
+        return KeyDerivationFunction.OPENSSL_EVP_BYTES_TO_KEY.equals(kdf);
+    }
+```
+
+With the new `kdf` parameter, the key generation and cipher initialization code stays identical. Only the `iterationsCount` and `saltSize` are handled differently. 
+
+In the `DecryptCallback` we handle the custom salt format and initialize the `PBEParameterSpec` with the variable `iterationsCount`:
+ 
+```java
+@Override
+public void process(final InputStream in, final OutputStream out) throws IOException {
+    byte[] salt = new byte[saltSize];
+    try {
+        // If the KDF is OpenSSL, try to read the salt from the input stream
+        if (isOpenSSLKDF()) {
+            // The header and salt format is "Salted__salt x8b" in ASCII
+            // Try to read the header and salt from the input
+            byte[] header = new byte[PasswordBasedEncryptor.OPENSSL_EVP_HEADER_SIZE];
+            // Mark the stream in case there is no salt
+            in.mark(OPENSSL_EVP_HEADER_SIZE + 1);
+            StreamUtils.fillBuffer(in, header);
+            final byte[] headerMarkerBytes = OPENSSL_EVP_HEADER_MARKER.getBytes(StandardCharsets.US_ASCII);
+            if (!Arrays.equals(headerMarkerBytes, header)) {
+                // No salt present
+                salt = new byte[0];
+                // Reset the stream because we skipped 8 bytes of cipher text
+                in.reset();
+            }
+        }
+        StreamUtils.fillBuffer(in, salt);
+    } catch (final EOFException e) {
+        throw new ProcessException("Cannot decrypt because file size is smaller than salt size", e);
+    }
+    final PBEParameterSpec parameterSpec = new PBEParameterSpec(salt, getIterationsCount());
+    try {
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, parameterSpec);
+    } catch (final Exception e) {
+        throw new ProcessException(e);
+    }
+    final byte[] buffer = new byte[65536];
+    int len;
+    while ((len = in.read(buffer)) > 0) {
+        final byte[] decryptedBytes = cipher.update(buffer, 0, len);
+        if (decryptedBytes != null) {
+            out.write(decryptedBytes);
+        }
+    }
+    try {
+        out.write(cipher.doFinal());
+    } catch (final Exception e) {
+        throw new ProcessException(e);
+    }
+}
+```
+
+### Previous Process
+
+Here is the original content of this section which documented the process behind the new implementation of the encryptor. 
 
 Now that we have working code which reads the OpenSSL format and can decrypt it, the only step left is to package it in a way that NiFi likes. We don't need to add any properties to the `EncryptContent` processor as it already has `password` (if we wanted to provide non-PBE symmetric encryption, we would need a new property for the key. Again, a valuable feature for another day). The salt is embedded in the cipher text following the constant header, so we can extract that during the `DecryptCallback` and use it in conjunction with the password to derive the key and IV. 
 
@@ -309,3 +407,67 @@ AEAD ciphers not supported by the enc utility
 ```
 
 However, if you are doing encryption and decryption only in code and **do not need compatibility** with the command-line tool, I _strongly recommend_ GCM over CBC. It is fast and addresses more security concerns with the authentication tag than CBC alone. 
+
+### CBC IV Issue with OpenSSLPBEParametersGenerator
+
+At one time I was trying to migrate from the sandbox to NiFi and use the BouncyCastle `OpenSSLPBEParametersGenerator` with a JCE `Cipher` rather than the wrapped BouncyCastle `PaddedBufferedBlockCipher(CBCBlockCipher(AESEngine))` construct. I ran across a puzzling issue where the first block of the cipher text failed to decrypt but the rest of the message was fine. Obviously this is an IV issue, so I started looking at the IV in the cipher instance. The value was null, which was surprising, because I was passing the `IvParameterSpec` in as follows:
+
+```groovy
+        Cipher cipher = Cipher.getInstance("PBEWITHMD5AND256BITAES-CBC-OPENSSL", "BC")
+        // Cipher cipher = Cipher.getInstance("AES/CBC/PKCS7Padding")
+        
+        ParametersWithIV parametersWithIV = ((ParametersWithIV) gen.generateDerivedParameters(keyLengthBits, ivLengthBits));
+
+        final byte[] keyBytesFromParameters = ((KeyParameter) parametersWithIV.getParameters()).getKey();
+        SecretKey key = new SecretKeySpec(keyBytesFromParameters, "AES");
+
+        IvParameterSpec ivParameterSpec = new IvParameterSpec(parametersWithIV.IV)
+        logger.info("Created IvParameterSpec: ${Hex.encodeHexString(ivParameterSpec.IV)}")
+
+        // This isn't even using the IVParameterSpec
+        cipher.init(Cipher.DECRYPT_MODE, key, ivParameterSpec)
+        assert cipher.getIV() == ivParameterSpec.IV
+```
+
+Questioning my sanity, I switched to `AES/CBC/PKCS7Padding` and it immediately worked. What I eventually discovered is that using the `PBEWITHMD5AND256BITAES-CBC-OPENSSL` algorithm will demand that the IV is derived at the same time as the key using `PBEParameterSpec`. Just another gotcha to be aware of when switching between BouncyCastle and JCE ciphers. 
+
+### JCE Unlimited Strength Cryptography
+
+In order to use "strong" cryptography, you will need to install the [JCE Unlimited Strength Cryptography Policy Files](http://www.oracle.com/technetwork/java/javase/downloads/jce8-download-2133166.html) for your version of Java. Here is a [brief explanation](http://crypto.stackexchange.com/a/20525/12569) of import restrictions on cryptography. The JCA discusses the [maximum key lengths](http://docs.oracle.com/javase/7/docs/technotes/guides/security/SunProviders.html#importlimits) for each algorithm provided by the Oracle implementation. 
+
+As noted in that table, AES 128 bit encryption is supported in a default JRE. However, when some people tried to review my work, they ran into issues with "illegal key size". Through some debugging, we determined that the key is not fully derived from the `SecretKeyFactory` when it is provided to `cipher.init()`. Rather, it is the byte representation of the **raw password** that is then combined with the salt `PBEParameterSpec` during `init`. The problem is that the key length check occurs *before* this process, so Java complains that 18 bytes (the length of `thisIsABadPassword`) is longer than 16 bytes (128 bits), and stops executing. Even switching to `PBEWITHMD5ANDDES-OPENSSL`, for which the key length is a paltry 8 bytes and one is for parity (seriously, don't use DES), will fail on a system without the Unlimited Strength Cryptography Policy files. If my usual password paranoia didn't extend into testing, I would have used a simple `password` and this would not have been discovered. 
+
+After debugging on a system without the USC policies installed, this is our determination for PBE:
+
+Cipher  | Password length | Should Work | Does Work
+--------|-----------------|-------------|-----------
+AES-128 |   <= 16 chars   |     YES     |    YES
+AES-128 |    > 16 chars   |     YES     |     NO
+AES-192 |   <= 16 chars   |      NO     |    YES
+AES-192 |    > 16 chars   |      NO     |     NO
+AES-256 |   <= 16 chars   |      NO     |    YES
+AES-256 |    > 16 chars   |      NO     |     NO
+
+We verified that the higher key sizes are actually being used by encrypting files with OpenSSL AES-256 bit and a password <= 16 characters and then decrypting successfully within NiFi. This is actually something that I've never come across before and have an open question on [Information Security Stack Exchange](http://security.stackexchange.com/questions/107321/why-does-java-allow-aes-256-bit-encryption-on-systems-without-jce-unlimited-stre) looking for more information. 
+
+There is a way to get around this without requiring that all systems that run the tests install those files manually, but I am almost hesitant to post it because it is a hack and should not ever be used in a non-test system. 
+
+Using reflection, we can override the policies and tell Java to go ahead and use the longer key. Place this code before the `cipher.init()` command:
+
+```java
+if (Cipher.getMaxAllowedKeyLength("AES") < 256) {
+  try {
+    Field field = Class.forName("javax.crypto.JceSecurity").
+    getDeclaredField("isRestricted");
+    field.setAccessible(true);
+    field.set(null, java.lang.Boolean.FALSE);
+  } catch (Exception e) {
+    fail("Could not override JCE cryptography strength policy setting");
+    fail(e.getMessage());
+  }
+}
+```
+
+Now the tests will run successfully, but this is no substitution for actually loading the policy files into any Java installation where strong cryptography is required. 
+
+Rather than hack it like this, we used `Assume.assumeTrue()` statements to skip the tests on systems without the JCE USC policies installed. Aldrin also added custom validation to the processor to verify that the *combination* of algorithm key size and password length would be successful based on the system configuration. 
