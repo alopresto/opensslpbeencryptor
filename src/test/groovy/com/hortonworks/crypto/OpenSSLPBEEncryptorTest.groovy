@@ -18,6 +18,8 @@ import javax.crypto.spec.SecretKeySpec
 import java.lang.reflect.Field
 import java.security.InvalidKeyException
 import java.security.MessageDigest
+import java.security.Provider
+import java.security.Security
 
 import static groovy.test.GroovyAssert.shouldFail
 
@@ -766,6 +768,8 @@ public class OpenSSLPBEEncryptorTest {
     @Test
     public void testShouldDecryptUsingJCEAPIWithIV() throws Exception {
         // Arrange
+        Assume.assumeTrue("This test should only run when unlimited (256 bit) encryption is available", isUnlimitedStrengthCrypto())
+
         File file = new File("src/test/resources/salted_raw.enc")
         byte[] encryptedBytes = file.bytes
         logger.info("Read encrypted bytes: ${Hex.encodeHexString(encryptedBytes)}")
@@ -971,5 +975,87 @@ public class OpenSSLPBEEncryptorTest {
 
         // Assert
         assert msg =~ "Illegal key size"
+    }
+
+    @Test
+    public void testShouldNotEncryptAndDecryptWithPBELongPasswordWith128BitKeyAndDefaultJCEProvider() throws Exception {
+        // Arrange
+        Assume.assumeTrue("This test should only run when unlimited (256 bit) encryption is not available", !isUnlimitedStrengthCrypto())
+        logger.info("Running in limited encryption mode")
+
+        final String PASSWORD = "thisIsABadPassword"
+        String salt = "saltsalt"
+
+        final int EXPECTED_KEY_SIZE = 128
+
+        List<Provider> availableProviders = Security.providers
+        logger.info("Available JCE providers: ${availableProviders*.getName().join(", ")}")
+
+        def algorithms = ["PBEWITHMD5AND128BITAES-CBC-OPENSSL", "PBEWithHmacSHA1AndAES_128", "PBEWithHmacSHA1AndAES_256", "PBEWITHSHAAND256BITAES-CBC-BC"]
+
+        logger.info("Password: ${PASSWORD}")
+        logger.info("Salt    : ${salt}")
+
+        algorithms.each { String algorithm ->
+            logger.info("Checking algorithm ${algorithm}")
+
+            boolean cipherInitSucceeded = false
+            def workingProviders = []
+            def failedProviders = []
+
+            availableProviders.each { Provider provider ->
+                logger.info("Running with provider ${provider.getName()}")
+
+                if (!provider.getService("Cipher", algorithm)) {
+                    logger.warn("Provider ${provider.getName()} does not support cipher ${algorithm}")
+                } else {
+                    PBEKeySpec pbeSpec = new PBEKeySpec(PASSWORD.toCharArray());
+                    SecretKeyFactory secretKeyFactory = SecretKeyFactory.getInstance(algorithm, provider);
+                    SecretKey secretKey = secretKeyFactory.generateSecret(pbeSpec);
+                    PBEParameterSpec saltParams = new PBEParameterSpec(salt.getBytes("US-ASCII"), 1);
+
+                    Cipher cipher = Cipher.getInstance(algorithm, provider);
+
+                    // Act
+                    try {
+                        cipher.init(Cipher.ENCRYPT_MODE, secretKey, saltParams);
+                        assert cipher.spi.engineGetKeySize(secretKey) == EXPECTED_KEY_SIZE
+                        cipherInitSucceeded = true
+                        logger.warn("Provider ${provider.getName()} successfully initialized the cipher -- NOT DESIRED")
+                        workingProviders << provider.getName()
+                    } catch (InvalidKeyException e) {
+                        assert e.getMessage() =~ "Illegal key size"
+                        failedProviders << provider.getName()
+                        logger.warn("Expected error: ${e.getMessage()}")
+                    }
+                }
+            }
+
+            // Assert
+            logger.warn("The following providers successfully initialized the cipher: ${workingProviders.join(", ")}")
+            logger.warn("The following providers failed to initialize the cipher: ${failedProviders.join(", ")}")
+
+            logger.info("\n\n")
+        }
+    }
+
+    @Ignore("Just prints available security providers and ciphers")
+    @Test
+    void testShouldPrintAvailableCiphers() {
+        List<Provider> availableProviders = Security.providers
+        logger.info("Available JCE providers: ${availableProviders*.getName().join(", ")}")
+
+        availableProviders.each { Provider provider ->
+            Set<Provider.Service> ciphers = provider.getServices().findAll { it.type == "Cipher" }
+            if (ciphers) {
+                logger.info("Provider ${provider.getName()} has ${ciphers.size()} available ciphers")
+
+                ciphers.each { Provider.Service service ->
+                    logger.info("\t ${service}")
+                }
+
+                logger.info("\n\n")
+            }
+        }
     }
 }
